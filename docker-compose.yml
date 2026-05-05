@@ -1,78 +1,82 @@
+version: "3.9"
+
+networks:
+  alro:
+    driver: bridge
+
+volumes:
+  graph-data:    # persists sj_graph.graphml across routing-service restarts
+
 services:
-  inventory:
-    build: ./inventory-service
-    ports:
-      - "8002:8002"
-    environment:
-      - GRID_SIZE=${GRID_SIZE:-5}
-    networks:
-      - alro-net
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
-      interval: 5s
-      retries: 3
 
-  agent:
-    build:
-      context: .
-      dockerfile: agent-service/Dockerfile
-    ports:
-      - "8001:8001"
-    environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - GRID_SIZE=${GRID_SIZE:-5}
-      - INVENTORY_SERVICE_URL=http://inventory:8002
-      - TRAINING_EPISODES=${TRAINING_EPISODES:-500}
-      - EPSILON_DECAY=${EPSILON_DECAY:-0.995}
-      - QTABLE_PATH=/data/qtable.npy
+  routing-service:
+    build: ./routing-service
+    ports: ["8002:8002"]
     volumes:
-      - qtable-data:/data
-    depends_on:
-      inventory:
-        condition: service_healthy
-    networks:
-      - alro-net
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
-      interval: 5s
-      retries: 3
-
-  erp-stub:
-    build: ./erp-stub
-    ports:
-      - "8003:8003"
+      - graph-data:/data
     environment:
-      - GRID_SIZE=${GRID_SIZE:-5}
-      - AGENT_SERVICE_URL=http://agent:8001
-    depends_on:
-      agent:
-        condition: service_healthy
-    networks:
-      - alro-net
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+    networks: [alro]
+    depends_on: [otel-collector]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
-      interval: 5s
-      retries: 3
+      test: ["CMD", "curl", "-f", "http://localhost:8002/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 90s
+
+  solver-service:
+    build: ./solver-service
+    ports: ["8003:8003"]
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+    networks: [alro]
+    depends_on: [otel-collector]
+
+  planner-service:
+    build: ./planner-service
+    ports: ["8001:8001"]
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+    networks: [alro]
+    depends_on:
+      routing-service:
+        condition: service_healthy
+      solver-service:
+        condition: service_started
+
+  ai-service:
+    build: ./ai-service
+    ports: ["8004:8004"]
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+    networks: [alro]
+    depends_on: [planner-service]
 
   dashboard:
     build: ./dashboard
-    ports:
-      - "8501:8501"
-    environment:
-      - GRID_SIZE=${GRID_SIZE:-5}
-      - AGENT_SERVICE_URL=http://agent:8001
-      - INVENTORY_SERVICE_URL=http://inventory:8002
-      - ERP_STUB_URL=http://erp-stub:8003
-    depends_on:
-      - agent
-      - inventory
-      - erp-stub
-    networks:
-      - alro-net
+    ports: ["8501:8501"]
+    networks: [alro]
+    depends_on: [planner-service, ai-service]
 
-volumes:
-  qtable-data:
+  otel-collector:
+    image: otel/opentelemetry-collector:0.102.1
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./infra/otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports: ["4317:4317", "4318:4318"]
+    networks: [alro]
+    depends_on: [jaeger]
 
-networks:
-  alro-net:
-    driver: bridge
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    ports: ["16686:16686", "14250:14250"]
+    networks: [alro]
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    volumes:
+      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports: ["9090:9090"]
+    networks: [alro]
