@@ -92,20 +92,109 @@ with tab_data:
 
     # ── Order list with search filters ────────────────────────────────────────
     st.subheader("Current Orders")
-    f1, f2, _ = st.columns([1, 1, 3])
-    with f1:
-        filter_status = st.selectbox("Filter by status", ["all", "pending", "assigned", "delivered"])
-    with f2:
-        filter_priority = st.selectbox("Filter by priority", ["all", "normal", "high"])
 
-    orders = get_orders(
-        status=filter_status if filter_status != "all" else None,
-        priority=filter_priority if filter_priority != "all" else None,
-    )
-    if orders:
-        st.dataframe(pd.DataFrame(orders), use_container_width=True)
-    else:
-        st.info("No orders match the current filters.")
+    # Apply any filter the AI assistant pre-populated via apply_filter.
+    # The chat sidebar stores it in _pending_filter; we flush it here on each
+    # render so the widgets pick up the new values via their session state keys.
+    if "_pending_filter" in st.session_state:
+        pf = st.session_state.pop("_pending_filter")
+        if not pf:
+            # Empty dict = "show all" — reset every widget to its default
+            st.session_state["filter_status"] = "all"
+            st.session_state["filter_priority"] = "all"
+            st.session_state["filter_address"] = ""
+            st.session_state["filter_depot"] = "(all)"
+            st.session_state["filter_units_min"] = 0
+            st.session_state["filter_units_max"] = 0
+            st.session_state["filter_sort"] = "none"
+            st.session_state["filter_sort_order"] = "asc"
+            st.info("Filters cleared — showing all orders.")
+        else:
+            if "priority" in pf:
+                st.session_state["filter_priority"] = pf["priority"]
+            if "status" in pf:
+                st.session_state["filter_status"] = pf["status"]
+            if "delivery_address" in pf:
+                st.session_state["filter_address"] = pf["delivery_address"]
+            if "units_min" in pf:
+                st.session_state["filter_units_min"] = int(pf["units_min"])
+            if "units_max" in pf:
+                st.session_state["filter_units_max"] = int(pf["units_max"])
+            if "depot_id" in pf:
+                st.session_state["filter_depot"] = pf["depot_id"]
+            if "sort_by" in pf:
+                st.session_state["filter_sort"] = pf["sort_by"]
+            if "sort_order" in pf:
+                st.session_state["filter_sort_order"] = pf["sort_order"]
+            st.info("Filters set by AI assistant — showing all matching orders below.")
+
+    # Fetch depot list once per render to power the depot dropdown.
+    try:
+        _depots = get_depots()
+        _depot_options = ["(all)"] + [d["warehouse_id"] for d in _depots]
+    except Exception:
+        _depots = []
+        _depot_options = ["(all)"]
+
+    fa, fb, fc, fd, fe = st.columns([1, 1, 1, 1, 1])
+    with fa:
+        filter_status = st.selectbox(
+            "Status", ["all", "pending", "assigned", "delivered"], key="filter_status"
+        )
+    with fb:
+        filter_priority = st.selectbox(
+            "Priority", ["all", "normal", "high"], key="filter_priority"
+        )
+    with fc:
+        filter_address = st.text_input(
+            "Address contains", placeholder="e.g. Santana Row", key="filter_address"
+        )
+        # Ensure any AI-injected depot value is a valid option; fall back to "(all)" if not.
+        if st.session_state.get("filter_depot") not in _depot_options:
+            st.session_state["filter_depot"] = "(all)"
+        filter_depot = st.selectbox(
+            "Depot (post-plan)",
+            _depot_options,
+            key="filter_depot",
+            help="Shows orders assigned to this depot in the latest plan. "
+                 "Run optimization first.",
+        )
+    with fd:
+        filter_units_min = st.number_input(
+            "Min units", min_value=0, value=0, step=1, key="filter_units_min"
+        )
+        filter_units_max = st.number_input(
+            "Max units", min_value=0, value=0, step=1,
+            help="0 = no upper limit", key="filter_units_max"
+        )
+    with fe:
+        filter_sort = st.selectbox(
+            "Sort by", ["none", "units", "priority", "created_at", "status"], key="filter_sort"
+        )
+        filter_sort_order = st.radio(
+            "Order", ["asc", "desc"], horizontal=True, key="filter_sort_order"
+        )
+
+    active_sort_by = filter_sort if filter_sort != "none" else None
+    active_depot = filter_depot if filter_depot != "(all)" else None
+    try:
+        orders = get_orders(
+            status=filter_status if filter_status != "all" else None,
+            priority=filter_priority if filter_priority != "all" else None,
+            address=filter_address.strip() if filter_address.strip() else None,
+            units_min=filter_units_min if filter_units_min > 0 else None,
+            units_max=filter_units_max if filter_units_max > 0 else None,
+            depot_id=active_depot,
+            sort_by=active_sort_by,
+            sort_order=filter_sort_order if active_sort_by else None,
+        )
+        if orders:
+            st.caption(f"{len(orders)} order(s) matched")
+            st.dataframe(pd.DataFrame(orders), use_container_width=True)
+        else:
+            st.info("No orders match the current filters.")
+    except RuntimeError as e:
+        st.warning(str(e))
 
 with tab_plan:
     plan_left, plan_right = st.columns([1, 2])
@@ -191,6 +280,9 @@ with st.sidebar:
                     st.session_state.chat_history.append(
                         {"role": "assistant", "content": result["response"]}
                     )
+                    # apply_filter response — store for the Data tab to pick up on rerun
+                    if "pending_filter" in result:
+                        st.session_state["_pending_filter"] = result["pending_filter"]
                 except Exception as e:
                     st.error(str(e))
             st.rerun()

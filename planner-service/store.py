@@ -34,14 +34,68 @@ class Store:
             ids.append(oid)
         return ids
 
-    def get_orders(self, status: Optional[str] = None, priority: Optional[str] = None, address: Optional[str] = None) -> list[dict]:
+    def get_orders(
+        self,
+        status: Optional[str] = None,
+        priority: Optional[str] = None,
+        address: Optional[str] = None,
+        units_min: Optional[int] = None,
+        units_max: Optional[int] = None,
+        depot_id: Optional[str] = None,
+        created_after: Optional[str] = None,
+        sort_by: Optional[str] = None,
+        sort_order: str = "asc",
+        limit: Optional[int] = None,
+    ) -> list[dict]:
         records = list(self._orders.values())
+
+        # ── Filters ───────────────────────────────────────────────────────────────
         if status:
             records = [r for r in records if r.status == status]
         if priority:
             records = [r for r in records if r.priority == priority]
         if address:
             records = [r for r in records if r.delivery_address and address.lower() in r.delivery_address.lower()]
+        if units_min is not None:
+            records = [r for r in records if r.units >= units_min]
+        if units_max is not None:
+            records = [r for r in records if r.units <= units_max]
+        if created_after:
+            records = [r for r in records if r.created_at >= created_after]
+
+        # depot_id cross-references the latest plan's sub_orders.
+        # Orders carry no depot assignment until optimization has been run,
+        # so this filter is only meaningful post-plan.
+        if depot_id:
+            latest = self.get_latest_plan()
+            if latest is None:
+                raise LookupError("no_plan")
+            assigned_ids = {
+                so["parent_order_id"]
+                for so in latest.get("sub_orders", [])
+                if so.get("depot_id") == depot_id
+            }
+            records = [r for r in records if r.order_id in assigned_ids]
+
+        # ── Sort ─────────────────────────────────────────────────────────────────
+        _PRIORITY_RANK = {"high": 0, "normal": 1}
+        _SORT_KEYS = {
+            "units":      lambda r: r.units,
+            "priority":   lambda r: _PRIORITY_RANK.get(r.priority, 99),
+            "created_at": lambda r: r.created_at,
+            "status":     lambda r: r.status,
+        }
+        if sort_by and sort_by in _SORT_KEYS:
+            records = sorted(
+                records,
+                key=_SORT_KEYS[sort_by],
+                reverse=(sort_order.lower() == "desc"),
+            )
+
+        # ── Limit ─────────────────────────────────────────────────────────────────
+        if limit is not None and limit > 0:
+            records = records[:limit]
+
         return [vars(r) for r in records]
 
     def patch_order(self, order_id: str, updates: dict):
