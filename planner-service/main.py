@@ -115,9 +115,40 @@ async def create_orders(req: OrdersUpload):
 
 
 @app.get("/data/orders")
-def list_orders(status: Optional[str] = None, priority: Optional[str] = None, address: Optional[str] = None):
+def list_orders(
+    status: Optional[str] = None,
+    priority: Optional[str] = None,
+    address: Optional[str] = None,
+    units_min: Optional[int] = None,
+    units_max: Optional[int] = None,
+    depot_id: Optional[str] = None,
+    created_after: Optional[str] = None,
+    sort_by: Optional[str] = None,
+    sort_order: str = "asc",
+    limit: Optional[int] = None,
+):
     from store import store
-    return store.get_orders(status=status, priority=priority, address=address)
+    try:
+        return store.get_orders(
+            status=status,
+            priority=priority,
+            address=address,
+            units_min=units_min,
+            units_max=units_max,
+            depot_id=depot_id,
+            created_after=created_after,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            limit=limit,
+        )
+    except LookupError as e:
+        if str(e) == "no_plan":
+            raise HTTPException(
+                status_code=422,
+                detail="depot_id filter requires an optimization plan to have been run. "
+                       "Run optimization first, then filter by depot.",
+            )
+        raise
 
 
 @app.patch("/data/orders/{order_id}")

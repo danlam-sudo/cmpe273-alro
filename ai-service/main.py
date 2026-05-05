@@ -73,5 +73,8 @@ class ChatRequest(BaseModel):
 async def chat(req: ChatRequest):
     from tools import handle_message
     session_id = req.session_id or str(uuid.uuid4())
-    reply = await handle_message(session_id, req.message)
-    return {"response": reply, "session_id": session_id}
+    reply, pending_filter = await handle_message(session_id, req.message)
+    result = {"response": reply, "session_id": session_id}
+    if pending_filter is not None:
+        result["pending_filter"] = pending_filter
+    return result

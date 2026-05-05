@@ -28,7 +28,7 @@ alro/
 │   ├── main.py
 │   ├── store.py          # in-memory data store
 │   ├── orchestrator.py   # coordinate downstream calls + fallbacks
-│   ├── haversine.py      # fallback distance matrix
+│   ├── seed.py           # demo data loaded at startup
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── ai-service/
@@ -98,7 +98,7 @@ log = structlog.get_logger()
 def setup_telemetry(service_name: str):
     provider = TracerProvider()
     exporter = OTLPSpanExporter(
-        endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317"),
+        endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "otel-collector:4317"),
         insecure=True
     )
     provider.add_span_processor(BatchSpanProcessor(exporter))
@@ -737,7 +737,7 @@ class OrderRecord:
     delivery_lat: Optional[float] = None   # resolved by POST /data/orders via geocoding
     delivery_lon: Optional[float] = None
     status: str = "pending"
-    created_at: str = field(default_factory=lambda: datetime.datetime.utcnow().isoformat())
+    created_at: str = field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc).isoformat())
 
 class Store:
     def __init__(self):
@@ -755,12 +755,14 @@ class Store:
             ids.append(oid)
         return ids
 
-    def get_orders(self, status=None, priority=None) -> list[dict]:
+    def get_orders(self, status=None, priority=None, address=None) -> list[dict]:
         records = list(self._orders.values())
         if status:
             records = [r for r in records if r.status == status]
         if priority:
             records = [r for r in records if r.priority == priority]
+        if address:
+            records = [r for r in records if r.delivery_address and address.lower() in r.delivery_address.lower()]
         return [vars(r) for r in records]
 
     def patch_order(self, order_id: str, updates: dict):
@@ -898,7 +900,56 @@ def _haversine(lat1, lon1, lat2, lon2) -> float:
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 ```
 
-### 4.4 Data endpoints and plan endpoint (`main.py`)
+### 4.4 Demo data seed (`seed.py`)
+
+`planner-service` loads demo data at startup so the app works immediately without
+any manual CSV uploads. The lifespan function calls `seed()` before setting `is_ready`.
+
+```python
+from store import store
+
+INVENTORY = [
+    {"warehouse_id": "W1", "lat": 37.3382, "lon": -121.8863, "units_available": 600},  # Downtown SJ
+    {"warehouse_id": "W2", "lat": 37.4008, "lon": -121.9500, "units_available": 500},  # North SJ / Alviso
+]
+
+VEHICLES = [
+    {"vehicle_id": "V1", "depot_id": "W1", "capacity_units": 200},
+    {"vehicle_id": "V2", "depot_id": "W1", "capacity_units": 200},
+    {"vehicle_id": "V3", "depot_id": "W2", "capacity_units": 200},
+    {"vehicle_id": "V4", "depot_id": "W2", "capacity_units": 200},
+]
+
+ORDERS = [
+    # West SJ
+    {"delivery_address": "Santana Row, San Jose, CA",         "delivery_lat": 37.3197, "delivery_lon": -121.9475, "units": 40,  "priority": "normal"},
+    {"delivery_address": "Valley Fair Mall, San Jose, CA",    "delivery_lat": 37.3254, "delivery_lon": -121.9447, "units": 25,  "priority": "high"},
+    # South SJ
+    {"delivery_address": "Willow Glen, San Jose, CA",         "delivery_lat": 37.3065, "delivery_lon": -121.8882, "units": 35,  "priority": "normal"},
+    {"delivery_address": "Blossom Hill, San Jose, CA",        "delivery_lat": 37.2398, "delivery_lon": -121.8623, "units": 30,  "priority": "high"},
+    # ... (12 total; see seed.py for full list)
+]
+
+def seed():
+    store.set_inventory(INVENTORY)
+    store.set_vehicles(VEHICLES)
+    store.add_orders(ORDERS)
+```
+
+In `main.py` lifespan:
+
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global is_ready
+    from seed import seed
+    seed()
+    is_ready = True
+    log.info("planner_service_ready")
+    yield
+```
+
+### 4.5 Data endpoints and plan endpoint (`main.py`)
 
 All planner endpoints are in one file. Data endpoints are synchronous (pure in-memory
 reads/writes); only the geocoding call inside `POST /data/orders` is async.
@@ -955,8 +1006,8 @@ async def create_orders(req: OrdersUpload):
     return {"order_ids": ids, "count": len(ids)}
 
 @app.get("/data/orders")
-def list_orders(status: Optional[str] = None, priority: Optional[str] = None):
-    return store.get_orders(status=status, priority=priority)
+def list_orders(status: Optional[str] = None, priority: Optional[str] = None, address: Optional[str] = None):
+    return store.get_orders(status=status, priority=priority, address=address)
 
 @app.patch("/data/orders/{order_id}")
 def update_order(order_id: str, updates: OrderUpdate):
@@ -970,6 +1021,10 @@ def update_order(order_id: str, updates: OrderUpdate):
 def upload_vehicles(req: VehiclesUpload):
     store.set_vehicles(req.vehicles)
     return {"count": len(req.vehicles)}
+
+@app.get("/data/vehicles")
+def list_vehicles():
+    return store.get_vehicles()
 
 @app.post("/data/inventory")
 def upload_inventory(req: InventoryUpload):
@@ -993,29 +1048,53 @@ def get_plan(plan_id: str):
 async def plan():
     tracer = trace.get_tracer(__name__)
 
-    orders   = store.get_orders()
-    depots   = store.get_depots()
-    vehicles = store.get_vehicles()
+    all_orders = store.get_orders()
+    depots     = store.get_depots()
+    vehicles   = store.get_vehicles()
 
-    if not orders or not depots or not vehicles:
+    if not all_orders or not depots or not vehicles:
         return JSONResponse(status_code=422, content={"detail": "Orders, depots, and vehicles must all be loaded before planning."})
 
-    # Exclude orders that were never geocoded
-    orders = [o for o in orders if o.get("delivery_lat") and o.get("delivery_lon")]
+    # Exclude orders without resolved coordinates; record them as skipped
+    def _skip(o, reason):
+        return {"order_id": o.get("order_id"), "address": o.get("delivery_address"),
+                "units": o.get("units"), "priority": o.get("priority"), "reason": reason}
+
+    skipped_orders = [_skip(o, "no coordinates") for o in all_orders
+                      if not (o.get("delivery_lat") and o.get("delivery_lon"))]
+    orders = [o for o in all_orders if o.get("delivery_lat") and o.get("delivery_lon")]
     if not orders:
         return JSONResponse(status_code=422, content={"detail": "No orders with resolved coordinates."})
 
-    # Validate supply covers demand
-    total_demand = sum(o["units"] for o in orders)
-    total_supply = sum(d["units_available"] for d in depots)
-    if total_demand > total_supply:
-        return JSONResponse(status_code=422, content={
-            "detail": f"Total demand ({total_demand}) exceeds total supply ({total_supply}). "
-                      f"Adjust orders or inventory before planning."
-        })
+    # Drop orders that exceed every vehicle's capacity (splitting can't help —
+    # each sub_order must fit in one vehicle trip)
+    max_cap = max((v["capacity_units"] for v in vehicles), default=0)
+    oversized = [o for o in orders if o["units"] > max_cap]
+    for o in oversized:
+        skipped_orders.append(_skip(o, f"exceeds max vehicle capacity ({max_cap} units)"))
+    orders = [o for o in orders if o["units"] <= max_cap]
+    if not orders:
+        return JSONResponse(status_code=422, content={"detail": "All orders exceed the largest vehicle capacity."})
 
-    # Build combined location list: depots first, then delivery locations
-    # This ordering must stay consistent with solver-service expectations
+    # If total demand exceeds supply, prioritize high-priority orders first, then fill
+    # greedily with normal-priority. Deferred orders are recorded in skipped_orders.
+    total_supply = sum(d["units_available"] for d in depots)
+    total_demand = sum(o["units"] for o in orders)
+    if total_demand > total_supply:
+        sorted_candidates = sorted(orders, key=lambda o: 0 if o.get("priority") == "high" else 1)
+        selected, running = [], 0
+        for o in sorted_candidates:
+            if running + o["units"] <= total_supply:
+                selected.append(o)
+                running += o["units"]
+            else:
+                skipped_orders.append(_skip(o, "deferred — insufficient supply"))
+        orders = selected
+        if not orders:
+            return JSONResponse(status_code=422, content={"detail": "Supply exhausted — no orders could be fulfilled."})
+
+    # Build combined location list: depots first, then delivery locations.
+    # This ordering is a contract with solver-service — must not change.
     locations = (
         [(d["lat"], d["lon"]) for d in depots] +
         [(o["delivery_lat"], o["delivery_lon"]) for o in orders]
@@ -1031,10 +1110,9 @@ async def plan():
     routes = solve_result["routes"]
     with tracer.start_as_current_span("get_route_geometries"):
         for route in routes:
-            segments = []
-            prev = None
             depot = next(d for d in depots if d["warehouse_id"] == route["depot_id"])
             prev = (depot["lat"], depot["lon"])
+            segments = []
             for stop in route["stops"]:
                 segments.append((prev, (stop["lat"], stop["lon"])))
                 prev = (stop["lat"], stop["lon"])
@@ -1042,26 +1120,30 @@ async def plan():
             for stop, geom in zip(route["stops"], geometries):
                 stop["road_geometry"] = geom
 
-    plan = {
+    sub_orders = solve_result["sub_orders"]
+    from collections import Counter
+    split_counts = Counter(so["parent_order_id"] for so in sub_orders)
+    n_splits = sum(1 for count in split_counts.values() if count > 1)
+
+    result = {
         "routes": routes,
-        "sub_orders": solve_result["sub_orders"],
+        "sub_orders": sub_orders,
         "partial": partial,
         "routing_fallback": routing_fallback,
+        "skipped_orders": skipped_orders,
         "kpis": {
             "orders_fulfilled": len(orders),
-            "cross_depot_splits": sum(
-                1 for so in solve_result["sub_orders"]
-                if len([x for x in solve_result["sub_orders"] if x["parent_order_id"] == so["parent_order_id"]]) > 1
-            ),
+            "orders_skipped": len(skipped_orders),
+            "cross_depot_splits": n_splits,
             "avg_utilization_pct": round(
                 sum(r.get("utilization_pct", 0) for r in routes) / max(len(routes), 1), 1
-            )
-        }
+            ),
+        },
     }
 
-    plan_id = store.save_plan(plan)
-    plan["plan_id"] = plan_id
-    return plan
+    plan_id = store.save_plan(result)
+    result["plan_id"] = plan_id
+    return result
 ```
 
 ---
@@ -1079,7 +1161,20 @@ httpx>=0.27.0
 
 ### 5.2 Tool definitions (`tools.py`)
 
+The Anthropic client is lazily initialized so the service starts cleanly even when
+`ANTHROPIC_API_KEY` is not set — the key is only required when `/chat` is called.
+
 ```python
+import anthropic
+
+_client: anthropic.Anthropic | None = None
+
+def _get_client() -> anthropic.Anthropic:
+    global _client
+    if _client is None:
+        _client = anthropic.Anthropic()   # reads ANTHROPIC_API_KEY from env
+    return _client
+
 TOOLS = [
     {
         "name": "create_order",
@@ -1122,13 +1217,20 @@ TOOLS = [
     },
     {
         "name": "search_orders",
-        "description": "Search or list orders by status, priority, or area.",
+        "description": (
+            "Search orders. Use this to look up orders by address, status, or priority — "
+            "including when you need to find an order_id before calling update_order_priority. "
+            "Returns up to 10 matches."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
+                "delivery_address": {
+                    "type": "string",
+                    "description": "Partial address string to search for (case-insensitive substring match)."
+                },
                 "status":   {"type": "string", "enum": ["pending", "assigned", "delivered"]},
-                "priority": {"type": "string", "enum": ["normal", "high"]},
-                "area":     {"type": "string", "description": "Neighborhood or area name to filter by"}
+                "priority": {"type": "string", "enum": ["normal", "high"]}
             }
         }
     },
@@ -1154,13 +1256,12 @@ You are a logistics dispatch assistant for a San Jose delivery operation.
 You help dispatchers manage orders, check status, and trigger route planning.
 
 You have exactly five tools. Use them to take actions when the dispatcher makes a
-request. If a dispatcher's request cannot be handled by one of your tools, say so
-clearly rather than guessing.
+request. If a request cannot be handled by one of your tools, say so clearly.
 
 When creating orders, pass the address exactly as the dispatcher described it.
 Do not generate or guess lat/lon coordinates — the system resolves addresses itself.
 
-Be concise. Dispatchers are busy. One or two sentences is usually enough.
+Be concise. One or two sentences is usually enough.
 """
 ```
 
@@ -1181,14 +1282,12 @@ def clear(session_id: str):
     _sessions[session_id] = []
 ```
 
-### 5.4 Tool dispatch and multi-turn flow (`tools.py`)
+### 5.4 Tool dispatch and agentic loop (`tools.py`)
 
 ```python
 import httpx
-import anthropic
 
 PLANNER_URL = "http://planner-service:8001"
-client = anthropic.Anthropic()
 
 async def execute_tool(name: str, inputs: dict) -> str:
     """
@@ -1212,89 +1311,114 @@ async def execute_tool(name: str, inputs: dict) -> str:
                 return "Priority updated."
 
             elif name == "search_orders":
-                r = await http.get(f"{PLANNER_URL}/data/orders",
-                                   params={k: v for k, v in inputs.items() if v},
-                                   timeout=5.0)
+                params = {k: v for k, v in inputs.items() if v}
+                # delivery_address maps to the 'address' query param on planner-service
+                if "delivery_address" in params:
+                    params["address"] = params.pop("delivery_address")
+                r = await http.get(f"{PLANNER_URL}/data/orders", params=params, timeout=5.0)
                 r.raise_for_status()
                 orders = r.json()
-                return f"{len(orders)} orders found: {orders[:5]}"  # cap for context size
+                if not orders:
+                    return "No orders matched."
+                return f"{len(orders)} order(s) found: {orders[:10]}"  # cap for context size
 
             elif name == "trigger_replan":
                 r = await http.post(f"{PLANNER_URL}/plan", timeout=20.0)
                 r.raise_for_status()
                 data = r.json()
-                return (f"Plan complete. {data['kpis']['orders_fulfilled']} orders, "
-                        f"{data['kpis']['cross_depot_splits']} splits, "
-                        f"{data['kpis']['avg_utilization_pct']}% avg utilization."
-                        + (" (partial — time limit reached)" if data.get("partial") else ""))
+                kpis = data["kpis"]
+                msg = (f"Plan complete. {kpis['orders_fulfilled']} orders fulfilled, "
+                       f"{kpis['cross_depot_splits']} cross-depot splits, "
+                       f"{kpis['avg_utilization_pct']}% avg utilization.")
+                if data.get("partial"):
+                    msg += " (partial — solver hit time limit)"
+                if data.get("routing_fallback"):
+                    msg += " (road distances unavailable — used straight-line estimate)"
+                skipped = data.get("skipped_orders", [])
+                deferred = [s for s in skipped if s.get("reason", "").startswith("deferred")]
+                if deferred:
+                    msg += (f" {len(deferred)} order(s) deferred due to insufficient supply: "
+                            + ", ".join(s.get("address") or s.get("order_id", "?") for s in deferred))
+                elif kpis.get("orders_skipped", 0):
+                    msg += f" {kpis['orders_skipped']} order(s) skipped (no coordinates)."
+                return msg
 
             elif name == "get_plan_summary":
                 plan_id = inputs.get("plan_id", "latest")
                 r = await http.get(f"{PLANNER_URL}/plan/{plan_id}", timeout=5.0)
                 r.raise_for_status()
-                return str(r.json())
+                data = r.json()
+                kpis = data.get("kpis", {})
+                return (f"Plan {data.get('plan_id', plan_id)}: "
+                        f"{kpis.get('orders_fulfilled', '?')} orders, "
+                        f"{len(data.get('routes', []))} routes, "
+                        f"{kpis.get('avg_utilization_pct', '?')}% avg utilization.")
 
         except httpx.HTTPStatusError as e:
-            return f"Error: {e.response.status_code} — {e.response.text}"
+            return f"Error {e.response.status_code}: {e.response.text}"
         except Exception as e:
             return f"Tool execution failed: {str(e)}"
 
+    return "Unknown tool."
+
 async def handle_message(session_id: str, message: str) -> str:
     from session import get_history, append
-    # TOOLS, SYSTEM_PROMPT, execute_tool are defined earlier in this file — no import needed
 
     history = get_history(session_id)
     append(session_id, "user", message)
 
-    # Turn 1: get tool call or direct response
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=512,
-        system=SYSTEM_PROMPT,
-        tools=TOOLS,
-        messages=history + [{"role": "user", "content": message}]
-    )
+    messages = history + [{"role": "user", "content": message}]
 
-    if response.stop_reason == "tool_use":
-        tool_block = next(b for b in response.content if b.type == "tool_use")
-
-        # Execute the tool
-        tool_result = await execute_tool(tool_block.name, tool_block.input)
-
-        # Turn 2: send result back to Claude for final response
-        followup_messages = (
-            history
-            + [{"role": "user", "content": message}]
-            + [{"role": "assistant", "content": response.content}]
-            + [{
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": tool_block.id,
-                    "content": tool_result
-                }]
-            }]
-        )
-        final = client.messages.create(
+    # Agentic loop — Claude calls tools as needed, chaining them until it has
+    # enough information to give a final answer. Capped at 5 iterations.
+    MAX_STEPS = 5
+    for _ in range(MAX_STEPS):
+        response = _get_client().messages.create(
             model="claude-sonnet-4-6",
             max_tokens=512,
             system=SYSTEM_PROMPT,
             tools=TOOLS,
-            messages=followup_messages
+            messages=messages,
         )
-        reply = final.content[0].text
-    else:
-        reply = response.content[0].text
 
+        if response.stop_reason != "tool_use":
+            break
+
+        # Execute every tool block in this response (usually one, occasionally more)
+        tool_results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            result = await execute_tool(block.name, block.input)
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": result,
+            })
+
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "user", "content": tool_results})
+
+    reply = next(
+        (block.text for block in response.content if hasattr(block, "text")),
+        "I was unable to complete that request.",
+    )
     append(session_id, "assistant", reply)
     return reply
 ```
 
 ### 5.5 Chat endpoint (`main.py`)
 
+The `/health` endpoint exposes whether the API key is configured so the dashboard
+can show an appropriate warning when the key is missing.
+
 ```python
 from pydantic import BaseModel
-import uuid
+import uuid, os
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "ai_configured": bool(os.getenv("ANTHROPIC_API_KEY"))}
 
 class ChatRequest(BaseModel):
     message: str
@@ -1323,11 +1447,22 @@ pandas>=2.2.0
 
 ### 6.2 API client (`api_client.py`)
 
+`service_health()` returns a string per service (`"up"`, `"down"`, or `"no_key"` for
+the ai service when `ANTHROPIC_API_KEY` is absent), not a boolean. The dashboard uses
+these three states to show distinct warnings.
+
 ```python
 import httpx
 
 PLANNER = "http://planner-service:8001"
 AI      = "http://ai-service:8004"
+
+def _raise_friendly(e: httpx.HTTPStatusError) -> None:
+    try:
+        detail = e.response.json().get("detail", str(e))
+    except Exception:
+        detail = str(e)
+    raise RuntimeError(detail) from None
 
 def get_orders(**filters) -> list[dict]:
     r = httpx.get(f"{PLANNER}/data/orders", params=filters, timeout=5.0)
@@ -1349,15 +1484,46 @@ def upload_inventory(inventory: list[dict]) -> dict:
     r.raise_for_status()
     return r.json()
 
+def create_order(delivery_address: str, units: int, priority: str) -> dict:
+    try:
+        r = httpx.post(f"{PLANNER}/data/orders",
+                       json={"orders": [{"delivery_address": delivery_address,
+                                         "units": units, "priority": priority}]},
+                       timeout=15.0)
+        r.raise_for_status()
+        return r.json()
+    except httpx.HTTPStatusError as e:
+        _raise_friendly(e)
+
+def update_order_priority(order_id: str, priority: str) -> dict:
+    try:
+        r = httpx.patch(f"{PLANNER}/data/orders/{order_id}",
+                        json={"priority": priority}, timeout=5.0)
+        r.raise_for_status()
+        return r.json()
+    except httpx.HTTPStatusError as e:
+        _raise_friendly(e)
+
+def get_plan_summary(plan_id: str = "latest") -> dict:
+    try:
+        r = httpx.get(f"{PLANNER}/plan/{plan_id}", timeout=5.0)
+        r.raise_for_status()
+        return r.json()
+    except httpx.HTTPStatusError as e:
+        _raise_friendly(e)
+
 def get_depots() -> list[dict]:
     r = httpx.get(f"{PLANNER}/data/inventory", timeout=5.0)
     r.raise_for_status()
     return r.json()
 
 def run_plan() -> dict:
-    r = httpx.post(f"{PLANNER}/plan", timeout=20.0)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = httpx.post(f"{PLANNER}/plan", timeout=20.0)
+        r.raise_for_status()
+        return r.json()
+    except httpx.HTTPStatusError as e:
+        _raise_friendly(e)
 
 def chat(message: str, session_id: str | None) -> dict:
     r = httpx.post(f"{AI}/chat",
@@ -1366,20 +1532,30 @@ def chat(message: str, session_id: str | None) -> dict:
     r.raise_for_status()
     return r.json()
 
-def service_health() -> dict[str, bool]:
-    services = {
-        "planner":  f"{PLANNER}/health",
-        "routing":  "http://routing-service:8002/health",
-        "solver":   "http://solver-service:8003/health",
-        "ai":       f"{AI}/health",
+def service_health() -> dict[str, str]:
+    """Returns 'up', 'down', or 'no_key' (ai only) per service."""
+    simple = {
+        "planner": f"{PLANNER}/health",
+        "routing": "http://routing-service:8002/health",
+        "solver":  "http://solver-service:8003/health",
     }
-    status = {}
-    for name, url in services.items():
+    result = {}
+    for name, url in simple.items():
         try:
-            status[name] = httpx.get(url, timeout=1.0).status_code == 200
+            result[name] = "up" if httpx.get(url, timeout=1.0).status_code == 200 else "down"
         except Exception:
-            status[name] = False
-    return status
+            result[name] = "down"
+
+    try:
+        r = httpx.get(f"{AI}/health", timeout=1.0)
+        if r.status_code == 200:
+            result["ai"] = "up" if r.json().get("ai_configured") else "no_key"
+        else:
+            result["ai"] = "down"
+    except Exception:
+        result["ai"] = "down"
+
+    return result
 ```
 
 ### 6.3 Map rendering (`map_render.py`)
@@ -1434,18 +1610,22 @@ def render_map(plan: dict, depots: list[dict]) -> str:
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
-import json
 from api_client import (get_orders, upload_orders, upload_vehicles, upload_inventory,
+                        create_order, update_order_priority, get_plan_summary,
                         get_depots, run_plan, chat, service_health)
 from map_render import render_map
 
-st.set_page_config(page_title="ALRO", layout="wide")
+st.set_page_config(page_title="ALRO — Logistics Optimizer", layout="wide")
+st.title("ALRO — Autonomous Logistics & Routing Optimizer")
 
 # ── Service health bar ────────────────────────────────────────────────────────
+# service_health() returns "up" / "down" / "no_key" — three distinct states
 health = service_health()
 cols = st.columns(len(health))
-for col, (name, ok) in zip(cols, health.items()):
-    col.metric(name, "✓" if ok else "✗")
+_labels = {"up": "✓ up", "down": "✗ down", "no_key": "⚠ no API key"}
+_deltas = {"up": None, "down": None, "no_key": "chat disabled"}
+for col, (name, state) in zip(cols, health.items()):
+    col.metric(name, _labels.get(state, state), delta=_deltas.get(state))
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab_data, tab_plan = st.tabs(["Data", "Route Plan"])
@@ -1455,13 +1635,15 @@ with tab_data:
     col1, col2, col3 = st.columns(3)
 
     with col1:
+        st.caption("Orders CSV — columns: delivery_address (or delivery_lat/delivery_lon), units, priority")
         f = st.file_uploader("Orders CSV", type="csv", key="orders_csv")
         if f:
             df = pd.read_csv(f)
-            upload_orders(df.to_dict("records"))
-            st.success(f"{len(df)} orders loaded")
+            result = upload_orders(df.to_dict("records"))
+            st.success(f"{result['count']} orders loaded")
 
     with col2:
+        st.caption("Vehicles CSV — columns: vehicle_id, depot_id, capacity_units")
         f = st.file_uploader("Vehicles CSV", type="csv", key="vehicles_csv")
         if f:
             df = pd.read_csv(f)
@@ -1469,55 +1651,132 @@ with tab_data:
             st.success(f"{len(df)} vehicles loaded")
 
     with col3:
+        st.caption("Inventory CSV — columns: warehouse_id, lat, lon, units_available")
         f = st.file_uploader("Inventory CSV", type="csv", key="inventory_csv")
         if f:
             df = pd.read_csv(f)
             upload_inventory(df.to_dict("records"))
             st.success(f"{len(df)} depots loaded")
 
+    st.divider()
+
+    # ── Manual order controls ─────────────────────────────────────────────────
+    st.subheader("Manual Order Controls")
+    ctrl_left, ctrl_right = st.columns(2)
+
+    with ctrl_left:
+        st.markdown("**Create Order**")
+        with st.form("create_order_form", clear_on_submit=True):
+            addr = st.text_input("Delivery address")
+            units = st.number_input("Units", min_value=1, value=10, step=1)
+            priority = st.selectbox("Priority", ["normal", "high"])
+            if st.form_submit_button("Create Order", type="primary"):
+                if not addr.strip():
+                    st.error("Delivery address is required.")
+                else:
+                    try:
+                        result = create_order(addr.strip(), int(units), priority)
+                        st.success(f"Created — ID: `{result['order_ids'][0]}`")
+                    except Exception as e:
+                        st.error(str(e))
+
+    with ctrl_right:
+        st.markdown("**Update Order Priority**")
+        with st.form("update_priority_form", clear_on_submit=True):
+            order_id = st.text_input("Order ID")
+            new_priority = st.selectbox("New priority", ["normal", "high"], key="upd_priority")
+            if st.form_submit_button("Update Priority", type="primary"):
+                if not order_id.strip():
+                    st.error("Order ID is required.")
+                else:
+                    try:
+                        update_order_priority(order_id.strip(), new_priority)
+                        st.success("Priority updated.")
+                    except Exception as e:
+                        st.error(str(e))
+
+    st.divider()
+
+    # ── Order list ────────────────────────────────────────────────────────────
     st.subheader("Current Orders")
-    # Always fetch from API — do not cache in session_state
-    orders = get_orders()
+    f1, f2, _ = st.columns([1, 1, 3])
+    with f1:
+        filter_status = st.selectbox("Filter by status", ["all", "pending", "assigned", "delivered"])
+    with f2:
+        filter_priority = st.selectbox("Filter by priority", ["all", "normal", "high"])
+
+    orders = get_orders(
+        status=filter_status if filter_status != "all" else None,
+        priority=filter_priority if filter_priority != "all" else None,
+    )
     if orders:
         st.dataframe(pd.DataFrame(orders), use_container_width=True)
+    else:
+        st.info("No orders match the current filters.")
 
 with tab_plan:
-    if st.button("Run Optimization", type="primary"):
-        with st.spinner("Optimizing routes..."):
-            try:
-                plan = run_plan()
-                st.session_state["current_plan"] = plan
-            except Exception as e:
-                st.error(str(e))
+    plan_left, plan_right = st.columns([1, 2])
 
-    if plan := st.session_state.get("current_plan"):
-        # KPI row
-        kpis = plan.get("kpis", {})
-        k1, k2, k3 = st.columns(3)
-        k1.metric("Orders Fulfilled", kpis.get("orders_fulfilled", 0))
-        k2.metric("Cross-Depot Splits", kpis.get("cross_depot_splits", 0))
-        k3.metric("Avg Utilization", f"{kpis.get('avg_utilization_pct', 0)}%")
+    with plan_left:
+        if st.button("Run Optimization", type="primary", use_container_width=True):
+            with st.spinner("Running LP allocation + MDVRP solver..."):
+                try:
+                    plan = run_plan()
+                    st.session_state["current_plan"] = plan
+                except Exception as e:
+                    st.error(str(e))
 
-        if plan.get("partial"):
-            st.warning("Plan is partial — solver reached time limit before finding the optimal solution.")
-        if plan.get("routing_fallback"):
-            st.info("Road geometry unavailable — showing approximate straight-line routes.")
+        st.divider()
+        st.markdown("**Get Plan Summary**")
+        with st.form("plan_summary_form"):
+            plan_id_input = st.text_input("Plan ID (leave blank for latest)")
+            if st.form_submit_button("Fetch Summary"):
+                pid = plan_id_input.strip() or "latest"
+                try:
+                    summary = get_plan_summary(pid)
+                    kpis = summary.get("kpis", {})
+                    st.metric("Orders Fulfilled", kpis.get("orders_fulfilled", "?"))
+                    st.metric("Routes", len(summary.get("routes", [])))
+                    st.metric("Avg Utilization", f"{kpis.get('avg_utilization_pct', '?')}%")
+                    st.caption(f"Plan ID: `{summary.get('plan_id', pid)}`")
+                except Exception as e:
+                    st.error(str(e))
 
-        # Map — fetch depot locations for markers
-        depots = get_depots()
-        components.html(render_map(plan, depots), height=520)
+    with plan_right:
+        if plan := st.session_state.get("current_plan"):
+            kpis = plan.get("kpis", {})
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Orders Fulfilled", kpis.get("orders_fulfilled", 0))
+            k2.metric("Cross-Depot Splits", kpis.get("cross_depot_splits", 0))
+            k3.metric("Avg Utilization", f"{kpis.get('avg_utilization_pct', 0)}%")
 
-        # Per-vehicle manifests
-        for route in plan.get("routes", []):
-            with st.expander(f"Truck {route['vehicle_id']} — {route['utilization_pct']}% utilization"):
-                st.dataframe(pd.DataFrame(route["stops"]))
+            if plan.get("partial"):
+                st.warning("Plan is partial — solver reached time limit before finding the optimal solution.")
+            if plan.get("routing_fallback"):
+                st.info("Road distances unavailable — routes show straight-line approximations.")
+
+            depots = get_depots()
+            components.html(render_map(plan, depots), height=480)
+
+            for route in plan.get("routes", []):
+                with st.expander(
+                    f"Truck {route['vehicle_id']} (depot {route['depot_id']}) — "
+                    f"{route['utilization_pct']}% utilization, {route['total_distance_km']} km"
+                ):
+                    st.dataframe(pd.DataFrame(route["stops"]), use_container_width=True)
+        else:
+            st.info("No plan yet. Run optimization or fetch a plan by ID.")
 
 # ── AI Chat sidebar ───────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("AI Assistant")
-    if not health.get("ai"):
-        st.warning("AI assistant unavailable — use the form interface.")
-    else:
+
+    ai_state = health.get("ai")
+    if ai_state == "down":
+        st.warning("AI assistant offline — use the manual controls above.")
+    elif ai_state == "no_key":
+        st.warning("ANTHROPIC_API_KEY not set — AI chat is disabled.")
+    elif ai_state == "up":
         if "chat_history" not in st.session_state:
             st.session_state.chat_history = []
         if "session_id" not in st.session_state:
@@ -1700,12 +1959,12 @@ should start cleanly with no errors, and the implemented endpoints should respon
 
 | Step | What gets built | Done when |
 |---|---|---|
-| **1** | All four service scaffolds: Dockerfile, `requirements.txt`, `main.py` with `/health`, `/ready`, `/metrics`, OTel wired, structlog configured. `docker-compose.yml` with all containers. | `docker compose up` → all eight containers start, all `/health` endpoints return 200 |
+| **1** | All four service scaffolds: Dockerfile, `requirements.txt`, `main.py` with `/health`, `/ready`, `/metrics`, OTel wired, structlog configured. `docker-compose.yml` with all containers. `seed.py` pre-populates planner-service with 2 depots, 4 vehicles, 12 demo orders at startup. | `docker compose up` → all eight containers start, all `/health` endpoints return 200; `GET /data/orders` returns 12 pre-seeded orders |
 | **2** | `routing-service`: `graph.py` (load/download, single-source Dijkstra matrix, cache), `/distances` endpoint, `/ready` returns 503 until graph loads | `POST /distances` returns a matrix for a list of SJ coordinates |
 | **3** | `routing-service`: `geocoding.py` and `geometry.py`, `/geocode` and `/geometry` endpoints | `POST /geocode` with "SAP Center, San Jose" returns lat/lon; `/geometry` returns road points |
 | **4** | `solver-service`: `models.py`, `allocation.py` (scipy LP), `/solve` partially (Phase 1 only, returns sub-orders) | `POST /solve` with test orders and depots returns sub-order list |
 | **5** | `solver-service`: `vrp.py` (OR-Tools MDVRP), `/solve` complete (both phases) | `POST /solve` returns routes with stop sequences |
-| **6** | `planner-service`: `store.py`, all `/data/*` endpoints, `haversine.py` | Orders, vehicles, inventory can be uploaded and retrieved |
+| **6** | `planner-service`: `store.py`, all `/data/*` endpoints (including `GET /data/vehicles`), `seed.py` | Orders, vehicles, inventory can be uploaded and retrieved; service pre-populates demo data on startup |
 | **7** | `planner-service`: `orchestrator.py`, `POST /plan` with fallback logic, manual OTel spans | Full plan cycle works end-to-end; routing fallback activates when `routing-service` is stopped |
 | **8** | `ai-service`: `tools.py` (schemas + dispatch), `session.py`, `/chat` endpoint | Chat returns a response; `create_order` via chat creates an order visible in planner |
 | **9** | `dashboard`: `api_client.py`, CSV upload, orders table, "Run Optimization" button, map render | Full standard UI flow works: upload → optimize → see map |

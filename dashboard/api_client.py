@@ -14,7 +14,8 @@ def _raise_friendly(e: httpx.HTTPStatusError) -> None:
 
 
 def get_orders(**filters) -> list[dict]:
-    r = httpx.get(f"{PLANNER}/data/orders", params=filters, timeout=5.0)
+    clean = {k: v for k, v in filters.items() if v is not None and v != ""}
+    r = httpx.get(f"{PLANNER}/data/orders", params=clean, timeout=5.0)
     r.raise_for_status()
     return r.json()
 
