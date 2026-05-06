@@ -103,6 +103,15 @@ async def solve_endpoint(req: SolveRequest):
     depots   = [Depot(**{k: v for k, v in d.items() if k in _depot_fields}) for d in req.depots]
     vehicles = [Vehicle(**{k: v for k, v in v.items() if k in _vehicle_fields}) for v in req.vehicles]
 
+    # Fix 1: zero out supply for depots that have no vehicles so the LP never
+    # allocates to them — a depot with inventory but no vehicles can't dispatch.
+    depot_ids_with_vehicles = {v.depot_id for v in vehicles}
+    for depot in depots:
+        if depot.warehouse_id not in depot_ids_with_vehicles:
+            log.warning("depot_zeroed_no_vehicles",
+                        depot=depot.warehouse_id, original_units=depot.units_available)
+            depot.units_available = 0
+
     # Phase 1: Haversine cost matrix for LP.
     # Road distances aren't available at allocation time; Haversine is accurate
     # enough to guide the LP toward depot-proximity-based assignment.
@@ -119,6 +128,15 @@ async def solve_endpoint(req: SolveRequest):
         sub_orders = await loop.run_in_executor(None, allocate, orders, depots, cost_matrix)
     except ValueError as e:
         return JSONResponse(status_code=422, content={"detail": str(e)})
+
+    # Fix 3 safety net: drop any sub_orders the LP assigned to vehicle-less depots.
+    # Should not trigger after Fix 1, but guards against LP numerical edge cases.
+    unroutable_so = [so for so in sub_orders if so.depot_id not in depot_ids_with_vehicles]
+    sub_orders    = [so for so in sub_orders if so.depot_id in depot_ids_with_vehicles]
+    if unroutable_so:
+        log.warning("sub_orders_dropped_no_vehicles",
+                    count=len(unroutable_so),
+                    depots=list({so.depot_id for so in unroutable_so}))
 
     # Build OR-Tools location list: depots first, then one node per sub_order.
     # Split orders produce multiple sub_orders at the same lat/lon — they must be
@@ -158,4 +176,5 @@ async def solve_endpoint(req: SolveRequest):
         "sub_orders": [vars(so) for so in sub_orders],
         "routes": [route_to_dict(r) for r in routes],
         "partial": partial,
+        "unroutable_sub_orders": [vars(so) for so in unroutable_so],
     }

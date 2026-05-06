@@ -200,22 +200,18 @@ Be concise. One or two sentences is usually enough.
 """
 
 
-async def execute_tool(name: str, inputs: dict) -> tuple[str, dict | None]:
+async def execute_tool(name: str, inputs: dict) -> tuple[str, dict]:
     """
     Maps tool name to planner-service endpoint.
-    Returns (result_string_for_claude, pending_filter_or_None).
-    pending_filter is non-None only for apply_filter calls; it is passed back
-    to the dashboard as metadata so the UI can pre-populate its filter widgets
-    without the data ever flowing through the AI context.
+    Returns (result_string_for_claude, side_effects).
+    side_effects is a plain dict with optional keys:
+      "pending_filter" — dashboard pre-populates filter widgets
+      "pending_plan"   — dashboard loads plan into Route Plan tab
     """
-    # apply_filter never calls the backend — it just packages the filter params
-    # for the dashboard to consume. No data enters the AI context.
     if name == "apply_filter":
         params = {k: v for k, v in inputs.items() if v is not None and v != ""}
         if not params:
-            # Empty params = clear all filters. Return an empty dict so the
-            # dashboard knows to reset every widget to its default state.
-            return "Filters cleared — the Data tab will now show all orders.", {}
+            return "Filters cleared — the Data tab will now show all orders.", {"pending_filter": {}}
         label_parts = []
         if "priority" in params:
             label_parts.append(f"{params['priority']}-priority")
@@ -230,7 +226,7 @@ async def execute_tool(name: str, inputs: dict) -> tuple[str, dict | None]:
         if "depot_id" in params:
             label_parts.append(f"depot={params['depot_id']}")
         label = ", ".join(label_parts) or "custom"
-        return f"Filter applied ({label}). The Data tab will show all matching orders.", params
+        return f"Filter applied ({label}). The Data tab will show all matching orders.", {"pending_filter": params}
 
     async with httpx.AsyncClient() as http:
         try:
@@ -241,7 +237,7 @@ async def execute_tool(name: str, inputs: dict) -> tuple[str, dict | None]:
                     timeout=15.0,
                 )
                 r.raise_for_status()
-                return f"Order created: {r.json()}", None
+                return f"Order created: {r.json()}", {}
 
             elif name == "update_order_priority":
                 r = await http.patch(
@@ -250,15 +246,12 @@ async def execute_tool(name: str, inputs: dict) -> tuple[str, dict | None]:
                     timeout=5.0,
                 )
                 r.raise_for_status()
-                return "Priority updated.", None
+                return "Priority updated.", {}
 
             elif name == "search_orders":
                 params = {k: v for k, v in inputs.items() if v is not None and v != ""}
-                # delivery_address maps to the 'address' query param on planner-service
                 if "delivery_address" in params:
                     params["address"] = params.pop("delivery_address")
-                # Cap at 25 — enough for reasoning without flooding the context.
-                # For display requests, use apply_filter instead.
                 params.setdefault("limit", 25)
                 r = await http.get(
                     f"{PLANNER_URL}/data/orders",
@@ -268,8 +261,8 @@ async def execute_tool(name: str, inputs: dict) -> tuple[str, dict | None]:
                 r.raise_for_status()
                 orders = r.json()
                 if not orders:
-                    return "No orders matched the given filters.", None
-                return f"{len(orders)} order(s) found: {orders}", None
+                    return "No orders matched the given filters.", {}
+                return f"{len(orders)} order(s) found: {orders}", {}
 
             elif name == "trigger_replan":
                 r = await http.post(f"{PLANNER_URL}/plan", timeout=20.0)
@@ -294,7 +287,7 @@ async def execute_tool(name: str, inputs: dict) -> tuple[str, dict | None]:
                     )
                 elif kpis.get("orders_skipped", 0):
                     msg += f" {kpis['orders_skipped']} order(s) skipped (no coordinates)."
-                return msg, None
+                return msg, {"pending_plan": data}
 
             elif name == "get_plan_summary":
                 plan_id = inputs.get("plan_id", "latest")
@@ -307,22 +300,22 @@ async def execute_tool(name: str, inputs: dict) -> tuple[str, dict | None]:
                     f"{kpis.get('orders_fulfilled', '?')} orders, "
                     f"{len(data.get('routes', []))} routes, "
                     f"{kpis.get('avg_utilization_pct', '?')}% avg utilization."
-                ), None
+                ), {}
 
         except httpx.HTTPStatusError as e:
-            return f"Error {e.response.status_code}: {e.response.text}", None
+            return f"Error {e.response.status_code}: {e.response.text}", {}
         except Exception as e:
-            return f"Tool execution failed: {e}", None
+            return f"Tool execution failed: {e}", {}
 
-    return "Unknown tool.", None
+    return "Unknown tool.", {}
 
 
-async def handle_message(session_id: str, message: str) -> tuple[str, dict | None]:
+async def handle_message(session_id: str, message: str) -> tuple[str, dict]:
     """
-    Returns (reply, pending_filter).
-    pending_filter is non-None when the AI called apply_filter — the dashboard
-    uses it to pre-populate the Data tab's filter widgets without any data
-    passing through the AI context.
+    Returns (reply, side_effects).
+    side_effects may contain:
+      "pending_filter" — dashboard pre-populates filter widgets
+      "pending_plan"   — dashboard loads plan into Route Plan tab and navigates there
     """
     from session import append, get_history
 
@@ -335,7 +328,7 @@ async def handle_message(session_id: str, message: str) -> tuple[str, dict | Non
     append(session_id, "user", message)
 
     messages = history + [{"role": "user", "content": message}]
-    pending_filter: dict | None = None
+    side_effects: dict = {}
 
     MAX_STEPS = 5
     for _ in range(MAX_STEPS):
@@ -369,9 +362,8 @@ async def handle_message(session_id: str, message: str) -> tuple[str, dict | Non
                     continue
                 _seen_calls.add(call_key)
             log.info("chat_tool_call", session=session_id, tool=block.name, inputs=block.input)
-            result_str, filter_params = await execute_tool(block.name, block.input)
-            if filter_params is not None:
-                pending_filter = filter_params
+            result_str, fx = await execute_tool(block.name, block.input)
+            side_effects.update(fx)
             log.info("chat_tool_result", session=session_id, tool=block.name, result=result_str)
             tool_results.append({
                 "type": "tool_result",
@@ -389,4 +381,4 @@ async def handle_message(session_id: str, message: str) -> tuple[str, dict | Non
 
     log.info("chat_turn", session=session_id, user=message, reply=reply)
     append(session_id, "assistant", reply)
-    return reply, pending_filter
+    return reply, side_effects

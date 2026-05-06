@@ -79,6 +79,12 @@ def get_depots() -> list[dict]:
     return r.json()
 
 
+def get_vehicles() -> list[dict]:
+    r = httpx.get(f"{PLANNER}/data/vehicles", timeout=5.0)
+    r.raise_for_status()
+    return r.json()
+
+
 def run_plan() -> dict:
     try:
         r = httpx.post(f"{PLANNER}/plan", timeout=20.0)

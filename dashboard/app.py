@@ -3,7 +3,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from api_client import (chat, create_order, get_depots, get_orders,
-                        get_plan_summary, run_plan, service_health,
+                        get_plan_summary, get_vehicles, run_plan, service_health,
                         update_order_priority, upload_inventory, upload_orders,
                         upload_vehicles)
 from map_render import render_map
@@ -21,6 +21,18 @@ for col, (name, state) in zip(cols, health.items()):
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
 tab_data, tab_plan = st.tabs(["Data", "Route Plan"])
+
+if st.session_state.pop("_switch_to_plan_tab", False):
+    components.html("""
+        <script>
+        setTimeout(function() {
+            const tabs = window.parent.document.querySelectorAll('[data-baseweb="tab"]');
+            for (const tab of tabs) {
+                if (tab.innerText.trim() === 'Route Plan') { tab.click(); break; }
+            }
+        }, 150);
+        </script>
+    """, height=0)
 
 with tab_data:
     st.subheader("Upload Data")
@@ -196,6 +208,41 @@ with tab_data:
     except RuntimeError as e:
         st.warning(str(e))
 
+    st.divider()
+
+    # ── Fleet & Inventory ──────────────────────────────────────────────────────
+    st.subheader("Fleet & Inventory")
+    try:
+        _vehicles = get_vehicles()
+        _depots   = get_depots()
+    except Exception:
+        _vehicles, _depots = [], []
+
+    if not _vehicles and not _depots:
+        st.info("No fleet or inventory data loaded. Upload Vehicles and Inventory CSVs above.")
+    else:
+        total_vehicle_capacity = sum(v.get("capacity_units", 0) for v in _vehicles)
+        total_inventory_units  = sum(d.get("units_available", 0) for d in _depots)
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Vehicles", len(_vehicles))
+        m2.metric("Total Vehicle Capacity", total_vehicle_capacity)
+        m3.metric("Total Inventory Units", total_inventory_units)
+
+        fi_left, fi_right = st.columns(2)
+        with fi_left:
+            st.caption("Depots / Warehouses")
+            if _depots:
+                st.dataframe(pd.DataFrame(_depots), use_container_width=True, hide_index=True)
+            else:
+                st.info("No inventory loaded.")
+        with fi_right:
+            st.caption("Vehicles")
+            if _vehicles:
+                st.dataframe(pd.DataFrame(_vehicles), use_container_width=True, hide_index=True)
+            else:
+                st.info("No vehicles loaded.")
+
 with tab_plan:
     plan_left, plan_right = st.columns([1, 2])
 
@@ -229,10 +276,11 @@ with tab_plan:
     with plan_right:
         if plan := st.session_state.get("current_plan"):
             kpis = plan.get("kpis", {})
-            k1, k2, k3 = st.columns(3)
+            k1, k2, k3, k4 = st.columns(4)
             k1.metric("Orders Fulfilled", kpis.get("orders_fulfilled", 0))
-            k2.metric("Cross-Depot Splits", kpis.get("cross_depot_splits", 0))
-            k3.metric("Avg Utilization", f"{kpis.get('avg_utilization_pct', 0)}%")
+            k2.metric("Orders Skipped", kpis.get("orders_skipped", 0))
+            k3.metric("Cross-Depot Splits", kpis.get("cross_depot_splits", 0))
+            k4.metric("Avg Utilization", f"{kpis.get('avg_utilization_pct', 0)}%")
 
             if plan.get("partial"):
                 st.warning("Plan is partial — solver reached time limit before finding the optimal solution.")
@@ -249,6 +297,14 @@ with tab_plan:
                     f"{route['total_distance_km']} km"
                 ):
                     st.dataframe(pd.DataFrame(route["stops"]), use_container_width=True)
+
+            skipped = plan.get("skipped_orders", [])
+            if skipped:
+                with st.expander(f"Skipped Orders ({len(skipped)})", expanded=True):
+                    st.dataframe(
+                        pd.DataFrame(skipped)[["order_id", "address", "units", "priority", "reason"]],
+                        use_container_width=True,
+                    )
         else:
             st.info("No plan yet. Run optimization or fetch a plan by ID.")
 
@@ -280,9 +336,11 @@ with st.sidebar:
                     st.session_state.chat_history.append(
                         {"role": "assistant", "content": result["response"]}
                     )
-                    # apply_filter response — store for the Data tab to pick up on rerun
                     if "pending_filter" in result:
                         st.session_state["_pending_filter"] = result["pending_filter"]
+                    if "pending_plan" in result:
+                        st.session_state["current_plan"] = result["pending_plan"]
+                        st.session_state["_switch_to_plan_tab"] = True
                 except Exception as e:
                     st.error(str(e))
             st.rerun()

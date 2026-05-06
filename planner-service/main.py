@@ -246,16 +246,19 @@ async def plan():
             content={"detail": "All orders exceed the largest vehicle capacity and cannot be served."},
         )
 
-    # If total demand exceeds supply, prioritize high-priority orders first,
-    # then greedily fill remaining capacity with normal-priority orders.
-    # Deferred orders are recorded in skipped_orders for the next planning run.
-    total_supply = sum(d["units_available"] for d in depots)
+    # Effective supply counts only depots that have at least one vehicle.
+    # A depot with inventory but no vehicles cannot dispatch — including it in
+    # the supply cap would allow the LP to allocate to it, causing VRP INFEASIBLE.
+    vehicle_depot_ids = {v["depot_id"] for v in vehicles}
+    effective_supply = sum(
+        d["units_available"] for d in depots if d["warehouse_id"] in vehicle_depot_ids
+    )
     total_demand = sum(o["units"] for o in orders)
-    if total_demand > total_supply:
+    if total_demand > effective_supply:
         sorted_candidates = sorted(orders, key=lambda o: 0 if o.get("priority") == "high" else 1)
         selected, running = [], 0
         for o in sorted_candidates:
-            if running + o["units"] <= total_supply:
+            if running + o["units"] <= effective_supply:
                 selected.append(o)
                 running += o["units"]
             else:
@@ -270,7 +273,7 @@ async def plan():
             "plan_supply_constrained",
             fulfilled=len(orders),
             deferred=len([s for s in skipped_orders if s["reason"] == "deferred — insufficient supply"]),
-            supply=total_supply,
+            effective_supply=effective_supply,
             demand=total_demand,
         )
 
@@ -308,23 +311,35 @@ async def plan():
             for stop, geom in zip(route["stops"], geometries):
                 stop["road_geometry"] = geom
 
+    # Surface sub_orders the solver dropped because their assigned depot had no vehicles.
+    order_lookup = {o["order_id"]: o for o in orders}
+    for so in solve_result.get("unroutable_sub_orders", []):
+        parent = order_lookup.get(so.get("parent_order_id"), {})
+        skipped_orders.append({
+            "order_id": so.get("parent_order_id"),
+            "address": parent.get("delivery_address"),
+            "units": so.get("units"),
+            "priority": parent.get("priority"),
+            "reason": f"no vehicles at assigned depot ({so.get('depot_id')})",
+        })
+
     # Count unique orders that have >1 sub_order (cross-depot splits)
     sub_orders = solve_result["sub_orders"]
     from collections import Counter
     split_counts = Counter(so["parent_order_id"] for so in sub_orders)
     n_splits = sum(1 for count in split_counts.values() if count > 1)
 
+    # orders_fulfilled = orders that appear in at least one routed sub_order
+    fulfilled_order_ids = {so["parent_order_id"] for so in sub_orders}
+
     result = {
         "routes": routes,
         "sub_orders": sub_orders,
         "partial": partial,
         "routing_fallback": routing_fallback,
-        "skipped_orders": [
-            {"order_id": o.get("order_id"), "reason": "no coordinates", "address": o.get("delivery_address")}
-            for o in skipped_orders
-        ],
+        "skipped_orders": skipped_orders,
         "kpis": {
-            "orders_fulfilled": len(orders),
+            "orders_fulfilled": len(fulfilled_order_ids),
             "orders_skipped": len(skipped_orders),
             "cross_depot_splits": n_splits,
             "avg_utilization_pct": round(
